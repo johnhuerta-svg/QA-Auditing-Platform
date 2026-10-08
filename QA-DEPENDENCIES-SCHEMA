@@ -1,0 +1,142 @@
+To complete the QA and Compliance platform application based on the schema and components provided in your document, here are the scaffolding project files:
+1. package.json
+JSON
+
+
+{
+  "name": "qa-compliance-platform",
+  "version": "1.0.0",
+  "description": "End-to-end Quality Assurance platform with weighted scoring and rebuttal workflows",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.11.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.24",
+    "@types/pg": "^8.11.2",
+    "@types/react": "^18.2.61",
+    "@types/react-dom": "^18.2.19",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  }
+}
+
+
+2. server.ts
+TypeScript
+
+
+import express, { Request, Response } from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { AuditService } from './services/audit.service';
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+app.use(cors());
+app.use(express.json());
+
+// API Routes
+app.post('/api/v1/audits', async (req: Request, res: Response) => {
+  try {
+    const audit = await AuditService.submitAudit(req.body);
+    return res.status(201).json({ success: true, data: audit });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/v1/audits/rebuttal', async (req: Request, res: Response) => {
+  try {
+    const rebuttal = await AuditService.fileRebuttal(req.body);
+    return res.status(201).json({ success: true, data: rebuttal });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
+3. App.tsx
+TypeScript
+
+
+import React, { useState } from 'react';
+import { AuditReviewForm } from './components/AuditReviewForm';
+import { CaseworkerRebuttalPanel } from './components/CaseworkerRebuttalPanel';
+
+export const App: React.FC = () => {
+  const [activeView, setActiveView] = useState<'auditor' | 'caseworker'>('auditor');
+
+  // Example IDs and 5-day future deadline for demonstration purposes
+  const sampleCaseId = 'c8b9d3f1-2834-4b1a-8f7b-112233445566';
+  const sampleAuditorId = 'a1b2c3d4-e5f6-7a8b-9c0d-123456789abc';
+  const sampleAuditId = 'f8e7d6c5-b4a3-2109-8765-43210fedcba9';
+  const sampleAuditItemId = '11223344-5566-7788-99aa-bbccddeeff00';
+  const sampleDeadline = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+      <nav className="bg-white border-b px-6 py-4 flex justify-between items-center shadow-sm">
+        <h1 className="font-bold text-lg text-slate-800">QA & Compliance Platform</h1>
+        <div className="space-x-2">
+          <button
+            onClick={() => setActiveView('auditor')}
+            className={`px-4 py-2 text-xs font-semibold rounded-md transition-colors ${
+              activeView === 'auditor' ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+            }`}
+          >
+            Auditor View
+          </button>
+          <button
+            onClick={() => setActiveView('caseworker')}
+            className={`px-4 py-2 text-xs font-semibold rounded-md transition-colors ${
+              activeView === 'caseworker' ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+            }`}
+          >
+            Caseworker Rebuttal Portal
+          </button>
+        </div>
+      </nav>
+
+      <main className="py-6">
+        {activeView === 'auditor' ? (
+          <AuditReviewForm caseId={sampleCaseId} auditorId={sampleAuditorId} />
+        ) : (
+          <div className="max-w-2xl mx-auto p-6 bg-white shadow rounded-lg mt-6">
+            <h2 className="text-xl font-bold mb-4 text-slate-800">Caseworker Dispute Resolution</h2>
+            <CaseworkerRebuttalPanel
+              auditId={sampleAuditId}
+              auditItemId={sampleAuditItemId}
+              policyCode="POL-20020"
+              deadline={sampleDeadline}
+            />
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+export default App;
+
+
+
