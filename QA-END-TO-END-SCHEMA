@@ -1,0 +1,457 @@
+Enterprise QA Application Layer Architecture & Code Implementation
+1. Database Schema Reference (PostgreSQL / SQL Server)
+-- Enums
+CREATE TYPE audit_status AS ENUM ('DRAFT', 'SUBMITTED', 'REBUTTAL_PENDING', 'FINALIZED');
+CREATE TYPE rebuttal_status AS ENUM ('PENDING', 'ACCEPTED', 'REJECTED');
+
+-- Caseworkers / Auditors
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(150) UNIQUE NOT NULL,
+    role VARCHAR(30) NOT NULL CHECK (role IN ('CASEWORKER', 'AUDITOR', 'SUPERVISOR', 'ADMIN')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Cases selected for audit
+CREATE TABLE cases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_number VARCHAR(50) UNIQUE NOT NULL,
+    program_type VARCHAR(50) NOT NULL, -- e.g., 'F&C Medicaid', 'Food & Nutrition'
+    caseworker_id UUID NOT NULL REFERENCES users(id),
+    sample_month DATE NOT NULL,
+    is_blind_sample BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Audit Checkpoint Definitions (Policy Rules & Weights)
+CREATE TABLE checklist_rules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_code VARCHAR(20) NOT NULL, -- e.g., 'POL-20020'
+    title VARCHAR(200) NOT NULL,
+    category VARCHAR(50) NOT NULL, -- 'Documentation', 'Budgeting', 'Notice Requirements'
+    weight NUMERIC(5, 2) NOT NULL, -- e.g., 15.00 points
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+-- Audits (Master Record)
+CREATE TABLE audits (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_id UUID NOT NULL REFERENCES cases(id),
+    auditor_id UUID NOT NULL REFERENCES users(id),
+    status audit_status DEFAULT 'DRAFT',
+    total_score NUMERIC(5, 2) DEFAULT 100.00,
+    rebuttal_deadline TIMESTAMP WITH TIME ZONE, -- 5-day window from submission
+    audited_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Audit Line Items (Scoring breakdown)
+CREATE TABLE audit_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    audit_id UUID NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+    rule_id UUID NOT NULL REFERENCES checklist_rules(id),
+    passed BOOLEAN NOT NULL DEFAULT TRUE,
+    points_deducted NUMERIC(5, 2) DEFAULT 0.00,
+    findings_notes TEXT,
+    policy_citation VARCHAR(100)
+);
+
+-- Caseworker Rebuttals / Disputes
+CREATE TABLE rebuttals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    audit_id UUID NOT NULL REFERENCES audits(id),
+    audit_item_id UUID NOT NULL REFERENCES audit_items(id),
+    caseworker_id UUID NOT NULL REFERENCES users(id),
+    rebuttal_text TEXT NOT NULL,
+    supervisor_notes TEXT,
+    status rebuttal_status DEFAULT 'PENDING',
+    submitted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    resolved_at TIMESTAMP WITH TIME ZONE
+);
+2. Backend Middleware & API (Node.js / Express / TypeScript)
+src/types/qa.types.ts
+export interface AuditItemInput {
+  ruleId: string;
+  passed: boolean;
+  findingsNotes?: string;
+  policyCitation?: string;
+}
+
+export interface CreateAuditDTO {
+  caseId: string;
+  auditorId: string;
+  items: AuditItemInput[];
+}
+
+export interface SubmitRebuttalDTO {
+  auditId: string;
+  auditItemId: string;
+  caseworkerId: string;
+  rebuttalText: string;
+}
+src/services/audit.service.ts
+import { Pool } from 'pg';
+import { CreateAuditDTO, SubmitRebuttalDTO } from '../types/qa.types';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+export class AuditService {
+  /**
+   * Calculates weighted score and establishes the 5-day rebuttal window
+   */
+  static async submitAudit(data: CreateAuditDTO) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Fetch active checklist rules to compute deductions
+      const rulesRes = await client.query('SELECT id, weight FROM checklist_rules WHERE is_active = TRUE');
+      const ruleWeightMap = new Map<string, number>(
+        rulesRes.rows.map(r => [r.id, parseFloat(r.weight)])
+      );
+
+      let totalDeductions = 0;
+      const calculatedItems = data.items.map(item => {
+
+        const weight = ruleWeightMap.get(item.ruleId) || 0;
+|---|weight;
+        totalDeductions += deduction;
+        return {
+          ...item,
+          pointsDeducted: deduction
+        };
+      });
+
+      const finalScore = Math.max(0, 100 - totalDeductions);
+
+      // 2. Set 5-day rebuttal deadline
+      const rebuttalDeadline = new Date();
+      rebuttalDeadline.setDate(rebuttalDeadline.getDate() + 5);
+
+      // 3. Insert Audit Record
+      const auditRes = await client.query(
+        `INSERT INTO audits (case_id, auditor_id, status, total_score, rebuttal_deadline, audited_at)
+         VALUES ($1, $2, 'SUBMITTED', $3, $4, NOW())
+         RETURNING *`,
+        [data.caseId, data.auditorId, finalScore, rebuttalDeadline]
+      );
+      const audit = auditRes.rows[0];
+
+      // 4. Batch insert line items
+      for (const item of calculatedItems) {
+        await client.query(
+          `INSERT INTO audit_items (audit_id, rule_id, passed, points_deducted, findings_notes, policy_citation)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [audit.id, item.ruleId, item.passed, item.pointsDeducted, item.findingsNotes || null, item.policyCitation || null]
+        );
+      }
+
+      await client.query('COMMIT');
+      return audit;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Submits a rebuttal with strict enforcement of the 5-day deadline
+   */
+  static async fileRebuttal(dto: SubmitRebuttalDTO) {
+    const auditRes = await pool.query(
+      'SELECT status, rebuttal_deadline FROM audits WHERE id = $1',
+      [dto.auditId]
+    );
+
+    if (auditRes.rows.length === 0) {
+      throw new Error('Audit record not found');
+    }
+
+    const { rebuttal_deadline, status } = auditRes.rows[0];
+    const now = new Date();
+
+    if (new Date(rebuttal_deadline) < now) {
+      throw new Error('Rebuttal window expired. Submissions must occur within 5 calendar days.');
+    }
+
+    if (status === 'FINALIZED') {
+      throw new Error('Cannot file a rebuttal against a finalized audit.');
+    }
+
+    const result = await pool.query(
+      `INSERT INTO rebuttals (audit_id, audit_item_id, caseworker_id, rebuttal_text, status)
+       VALUES ($1, $2, $3, $4, 'PENDING')
+       RETURNING *`,
+      [dto.auditId, dto.auditItemId, dto.caseworkerId, dto.rebuttalText]
+    );
+
+    // Update audit status to reflect pending rebuttal
+    await pool.query(
+      `UPDATE audits SET status = 'REBUTTAL_PENDING' WHERE id = $1`,
+      [dto.auditId]
+    );
+
+    return result.rows[0];
+  }
+}
+src/controllers/audit.controller.ts
+import { Request, Response } from 'express';
+import { AuditService } from '../services/audit.service';
+
+export const handleCreateAudit = async (req: Request, res: Response) => {
+  try {
+    const audit = await AuditService.submitAudit(req.body);
+    return res.status(201).json({ success: true, data: audit });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+};
+
+export const handleRebuttal = async (req: Request, res: Response) => {
+  try {
+    const rebuttal = await AuditService.fileRebuttal(req.body);
+    return res.status(201).json({ success: true, data: rebuttal });
+  } catch (err: any) {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+};
+3. Frontend Application Layer (React + TypeScript + Tailwind CSS)
+src/components/AuditReviewForm.tsx
+import React, { useState, useMemo } from 'react';
+
+interface ChecklistRule {
+  id: string;
+  ruleCode: string;
+  title: string;
+  category: string;
+  weight: number;
+}
+
+interface EvaluationState {
+  [ruleId: string]: {
+    passed: boolean;
+    notes: string;
+    citation: string;
+  };
+}
+
+const SAMPLE_RULES: ChecklistRule[] = [
+  { id: '1', ruleCode: 'POL-20020', title: 'Returned Mail Protocol & Verification', category: 'Notice Processing', weight: 15.0 },
+  { id: '2', ruleCode: 'POL-10040', title: 'Earned Income Budgeting & Paystub Conversion', category: 'Budgeting', weight: 20.0 },
+  { id: '3', ruleCode: 'POL-30010', title: 'Timely Disposition Notice Sent Within Window', category: 'Due Process', weight: 10.0 },
+  { id: '4', ruleCode: 'POL-40050', title: 'Mandatory Citizenship/Identity Verification Documentation', category: 'Eligibility', weight: 25.0 },
+];
+
+export const AuditReviewForm: React.FC<{ caseId: string; auditorId: string }> = ({ caseId, auditorId }) => {
+  const [evaluations, setEvaluations] = useState<EvaluationState>(() =>
+    SAMPLE_RULES.reduce((acc, rule) => {
+      acc[rule.id] = { passed: true, notes: '', citation: '' };
+      return acc;
+    }, {} as EvaluationState)
+  );
+
+  const [submitting, setSubmitting] = useState(false);
+
+  // Real-time weighted score calculation
+  const totalScore = useMemo(() => {
+    let score = 100;
+    SAMPLE_RULES.forEach(rule => {
+      if (!evaluations[rule.id]?.passed) {
+        score -= rule.weight;
+      }
+    });
+    return Math.max(0, score);
+  }, [evaluations]);
+
+  const togglePassed = (ruleId: string) => {
+    setEvaluations(prev => ({
+      ...prev,
+      [ruleId]: { ...prev[ruleId], passed: !prev[ruleId].passed }
+    }));
+  };
+
+  const updateNotes = (ruleId: string, notes: string) => {
+    setEvaluations(prev => ({
+      ...prev,
+      [ruleId]: { ...prev[ruleId], notes }
+    }));
+  };
+
+  const handleSubmitAudit = async () => {
+    setSubmitting(true);
+    const payload = {
+      caseId,
+      auditorId,
+      items: Object.entries(evaluations).map(([ruleId, val]) => ({
+        ruleId,
+        passed: val.passed,
+        findingsNotes: val.notes,
+        policyCitation: val.passed ? undefined : SAMPLE_RULES.find(r => r.id === ruleId)?.ruleCode
+      }))
+    };
+
+    try {
+      const res = await fetch('/api/v1/audits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) alert('Audit submitted successfully. 5-day rebuttal window initiated.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 bg-slate-50 min-h-screen text-slate-800">
+      <header className="flex justify-between items-center mb-8 border-b pb-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Case QA Evaluation</h1>
+          <p className="text-sm text-slate-500">Case ID: {caseId} | Blind Review Protocol</p>
+        </div>
+        <div className="text-right">
+          <span className="text-xs uppercase text-slate-400 font-semibold">Live Weighted Score</span>
+          <div className={`text-4xl font-extrabold ${totalScore >= 85 ? 'text-emerald-600' : 'text-amber-600'}`}>
+            {totalScore.toFixed(1)}%
+          </div>
+        </div>
+      </header>
+
+      <div className="space-y-4">
+        {SAMPLE_RULES.map(rule => {
+          const evalItem = evaluations[rule.id];
+          return (
+            <div key={rule.id} className="bg-white border rounded-lg p-5 shadow-sm">
+              <div className="flex justify-between items-start">
+                <div>
+                  <span className="inline-block px-2 py-0.5 text-xs font-semibold bg-slate-100 text-slate-700 rounded mr-2">
+                    {rule.ruleCode}
+                  </span>
+                  <span className="text-xs text-slate-400 font-medium">{rule.category}</span>
+                  <h3 className="text-base font-semibold mt-1">{rule.title}</h3>
+                </div>
+                <div className="flex items-center space-x-3">
+                  <span className="text-xs text-slate-500 font-medium">-{rule.weight} pts</span>
+                  <button
+                    onClick={() => togglePassed(rule.id)}
+                    className={`px-3 py-1.5 rounded-md text-xs font-bold transition-colors ${
+                      evalItem.passed
+                        ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'
+                        : 'bg-rose-100 text-rose-800 hover:bg-rose-200'
+                    }`}
+                  >
+                    {evalItem.passed ? 'PASSED' : 'DEFICIENCY'}
+                  </button>
+                </div>
+              </div>
+
+              {!evalItem.passed && (
+                <div className="mt-4 pt-3 border-t border-slate-100">
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">
+                    Auditor Findings & Policy Citation Notes
+                  </label>
+                  <textarea
+                    rows={2}
+                    className="w-full text-sm border rounded-md p-2 focus:ring-1 focus:ring-slate-400 outline-none"
+                    placeholder="Document specific policy deviation..."
+                    value={evalItem.notes}
+                    onChange={e => updateNotes(rule.id, e.target.value)}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-8 flex justify-end">
+        <button
+          onClick={handleSubmitAudit}
+          disabled={submitting}
+          className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg shadow-sm disabled:opacity-50"
+        >
+          {submitting ? 'Finalizing...' : 'Submit Audit & Start 5-Day Clock'}
+        </button>
+      </div>
+    </div>
+  );
+};
+src/components/CaseworkerRebuttalPanel.tsx
+import React, { useState } from 'react';
+
+interface Props {
+  auditId: string;
+  auditItemId: string;
+  policyCode: string;
+  deadline: string; // ISO date string
+}
+
+export const CaseworkerRebuttalPanel: React.FC<Props> = ({ auditId, auditItemId, policyCode, deadline }) => {
+  const [rebuttalText, setRebuttalText] = useState('');
+  const [submitted, setSubmitted] = useState(false);
+
+  const deadlineDate = new Date(deadline);
+  const isExpired = new Date() > deadlineDate;
+
+  const handleRebuttalSubmit = async () => {
+    const res = await fetch('/api/v1/audits/rebuttal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        auditId,
+        auditItemId,
+        rebuttalText
+      })
+    });
+    if (res.ok) setSubmitted(true);
+  };
+
+  if (isExpired) {
+    return (
+      <div className="p-4 bg-rose-50 border border-rose-200 rounded text-rose-800 text-sm">
+        The 5-day rebuttal window expired on {deadlineDate.toLocaleDateString()}. Disputed findings can no longer be submitted.
+      </div>
+    );
+  }
+
+  if (submitted) {
+    return (
+      <div className="p-4 bg-emerald-50 border border-emerald-200 rounded text-emerald-800 text-sm">
+        Rebuttal filed successfully. Status updated to <strong>REBUTTAL_PENDING</strong> for supervisor review.
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white border rounded-lg p-5 mt-4 space-y-3">
+      <div className="flex justify-between">
+        <h4 className="font-semibold text-sm">Dispute Finding: {policyCode}</h4>
+        <span className="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+          Window closes: {deadlineDate.toLocaleDateString()}
+        </span>
+      </div>
+      <textarea
+        rows={3}
+        className="w-full text-sm border rounded p-2 focus:ring-1 focus:ring-blue-500 outline-none"
+        placeholder="Provide documentation evidence or manual references to substantiate compliance..."
+        value={rebuttalText}
+        onChange={e => setRebuttalText(e.target.value)}
+      />
+      <button
+        onClick={handleRebuttalSubmit}
+        disabled={!rebuttalText.trim()}
+        className="px-4 py-1.5 bg-slate-900 text-white text-xs font-semibold rounded hover:bg-slate-800 disabled:opacity-50"
+      >
+        Submit Rebuttal for Review
+      </button>
+    </div>
+  );
+};
+Architectural Highlights
+Dynamic Weighted Scoring: Deductions tie directly to the configured weights in checklist_rules, recalculating immediately on the frontend for review transparency and locking down server-side during the transaction.
+5-Day Rebuttal Enforcement: The submitAudit routine sets rebuttal_deadline = NOW() + INTERVAL '5 days'. Any submission against POST /api/v1/audits/rebuttal rejects disputes received past this timestamp.
+Blind Sampling Support: The cases table tracks is_blind_sample, allowing supervisor/admin portals to mask caseworker identities during active audits to prevent evaluator bias.
+
