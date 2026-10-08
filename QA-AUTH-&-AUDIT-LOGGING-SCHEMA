@@ -1,0 +1,726 @@
+Enterprise Quality Assurance & Dynamic Web App Database Schema
+Schema Version: 3.0.0-UNIVERSAL | Classification: ENTERPRISE TEMPLATE
+Target Platform: SQL Server 2022+ (Enforces Enterprise OAuth2 / Federated Identity & Audit Logging)
+
+-- ================================================================================
+-- QA DATABASE — UNIVERSAL ENTERPRISE COMPLIANCE & AUDITING SCHEMA
+-- Schema Version: 3.0.0-UNIVERSAL | Classification: RESTRICTED
+-- Target Platform: SQL Server 2022+ (Enforces Enterprise OAuth2 & Audit Logging)
+-- ================================================================================
+
+CREATE DATABASE [ENTERPRISE_QA_DB];
+GO
+USE [ENTERPRISE_QA_DB];
+GO
+
+-- ================================================================================
+-- SECTION 1: IDENTITY, FEDERATION, & ACCESS CONTROL (IDENTITY PROVIDER)
+-- ================================================================================
+
+-- 1. Roles table with AccessLevel tier system mapped to Enterprise App Roles
+CREATE TABLE Roles (
+    RoleID INT IDENTITY(1,1) PRIMARY KEY,
+    RoleName NVARCHAR(50) NOT NULL UNIQUE, -- E.g., 'QA-Caseworker', 'QA-Supervisor'
+    AccessLevel INT NOT NULL CONSTRAINT CHK_Roles_AccessLevel CHECK (AccessLevel BETWEEN 1 AND 5),
+    PermissionBits INT NOT NULL DEFAULT 0, -- Bitwise evaluation of 15 granular permission bits
+    IdentityGroupObjectGUID UNIQUEIDENTIFIER NULL -- Direct mapping to Identity Provider / Entra ID Group Object ID
+);
+
+-- 2. Users table federated via Enterprise Identity Provider
+CREATE TABLE Users (
+    UserID INT IDENTITY(1,1) PRIMARY KEY,
+    Username NVARCHAR(100) NOT NULL UNIQUE, -- Primary login string (typically corporate email or ID)
+    IdentityUserGUID UNIQUEIDENTIFIER NOT NULL UNIQUE, -- Immutable Subject Identifier (sub/ObjectGUID) passed from OAuth2 token
+    RoleID INT NOT NULL CONSTRAINT FK_Users_Roles REFERENCES Roles(RoleID),
+    
+    -- Personnel Classification Flags
+    UserType VARCHAR(20) NOT NULL CONSTRAINT CHK_Users_Type CHECK (UserType IN ('FULL_TIME', 'PART_TIME', 'CONTRACTOR', 'SYSTEM_SERVICE')),
+    EmployeeAccountID NVARCHAR(50) NOT NULL UNIQUE, -- Official enterprise tracking identifier
+    
+    -- Session token lifecycle tracking delegated via OAuth2 JWT validation
+    LastTokenRefresh DATETIME NOT NULL DEFAULT GETDATE(),
+    ActiveSessionID VARCHAR(255) NULL, -- Corresponds to the 'sid' claim from the ID token
+    
+    AccountLockedUntil DATETIME NULL, -- Local secondary emergency lock override
+    Phone NVARCHAR(20) MASKED WITH (FUNCTION = 'partial(0,"XXX-XXX-",4)') NOT NULL, -- Dynamic Data Masking
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- ================================================================================
+-- SECTION 2: ENTERPRISE AUDIT & COMPLIANCE LOGGING
+-- ================================================================================
+
+-- 1. System Audit Log with JSON state capture and session tracking hooks
+CREATE TABLE SystemAuditLog (
+    AuditID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    TableName NVARCHAR(128) NOT NULL,
+    RecordID INT NOT NULL,
+    ActionType NVARCHAR(20) NOT NULL CONSTRAINT CHK_SystemAuditLog_Action CHECK (ActionType IN ('INSERT','UPDATE','DELETE','SELECT','EXPORT','PRINT','ENTERPRISE_AUTH','BREAK_GLASS')),
+    OldValue NVARCHAR(MAX) NULL, -- JSON snapshot before change
+    NewValue NVARCHAR(MAX) NULL, -- JSON snapshot after change
+    
+    -- Data Classification Mapping
+    DataSensitivity NVARCHAR(20) NOT NULL CONSTRAINT CHK_SystemAuditLog_Sensitivity CHECK (DataSensitivity IN ('FTI','PHI','MHI','42CFR','PII','STANDARD')),
+    RetentionCategory NVARCHAR(50) NOT NULL,
+    SAR_Reported BIT NOT NULL DEFAULT 0, -- Safeguard Review reporting flag
+    LogDateTime DATETIME NOT NULL DEFAULT GETDATE(),
+    
+    -- Traceability matrix back to active session context
+    PerformedByUserID INT NOT NULL CONSTRAINT FK_SystemAuditLog_Users REFERENCES Users(UserID),
+    SessionCorrelationID VARCHAR(255) NULL, 
+    ClientIPAddress VARCHAR(45) NOT NULL, -- Captured application client routing IP
+    
+    -- Automated Persistence Layer mapping statutory archival timelines
+    PurgeEligibleDate AS (
+        CASE 
+            WHEN DataSensitivity IN ('FTI', 'AUDIT', 'SECURITY') THEN DATEADD(year, 7, LogDateTime)
+            WHEN DataSensitivity IN ('PHI', 'PII') THEN DATEADD(year, 6, LogDateTime)
+            ELSE DATEADD(year, 3, LogDateTime)
+        END
+    ) PERSISTED
+);
+
+-- 2. Sensitive Data Access Log
+CREATE TABLE FTI_AccessLog (
+    FTILogID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    UserID INT NOT NULL CONSTRAINT FK_FTIAccess_Users REFERENCES Users(UserID),
+    CaseID INT NOT NULL,
+    AccessDateTime DATETIME NOT NULL DEFAULT GETDATE(),
+    BusinessJustification NVARCHAR(500) NOT NULL, -- Mandatory plain text reason input tracking
+    QueryParametersLogged NVARCHAR(MAX) NOT NULL, -- Serialized parameters parsed by enterprise API
+    SessionCorrelationID VARCHAR(255) NULL,
+    SAR_Reported BIT NOT NULL DEFAULT 0
+);
+
+-- 3. Recipient Data Break-Glass Protocol Engine
+CREATE TABLE BreakGlassLog (
+    BreakGlassID INT IDENTITY(1,1) PRIMARY KEY,
+    UserID INT NOT NULL CONSTRAINT FK_BreakGlass_Users REFERENCES Users(UserID),
+    EmergencyJustification NVARCHAR(1000) NOT NULL CONSTRAINT CHK_BreakGlass_Justification CHECK (LEN(EmergencyJustification) >= 1),
+    SupervisorNotifiedID INT NOT NULL CONSTRAINT FK_BreakGlass_Supervisor REFERENCES Users(UserID),
+    NotificationMethod NVARCHAR(50) NOT NULL DEFAULT 'WEBHOOK',
+    EscalatedToCompliance BIT NOT NULL DEFAULT 0,
+    Approved BIT NOT NULL DEFAULT 0,
+    StartTime DATETIME NOT NULL DEFAULT GETDATE(),
+    ReviewDeadline AS (DATEADD(hour, 24, StartTime)) PERSISTED -- Immutable 24-hour review SLA
+);
+
+-- 4. Audit Score Modification History
+CREATE TABLE AuditScoreHistory (
+    HistoryID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    AuditReviewID INT NOT NULL,
+    FieldChanged NVARCHAR(128) NOT NULL,
+    OldValue NVARCHAR(100) NULL,
+    NewValue NVARCHAR(100) NULL,
+    ChangeReason NVARCHAR(500) NOT NULL,
+    IPAddress VARCHAR(45) NOT NULL,
+    TokenSessionID VARCHAR(255) NOT NULL,
+    ModifiedByUserID INT NOT NULL CONSTRAINT FK_AuditScoreHistory_Users REFERENCES Users(UserID),
+    ModifiedDateTime DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- ================================================================================
+-- SECTION 3: CORE QUALITY ASSURANCE REVIEWS & CRYPTOGRAPHIC DATA INTEGRITY
+-- ================================================================================
+
+-- 1. Main Quality Assurance Review Table
+CREATE TABLE AuditReviews (
+    AuditReviewID INT IDENTITY(1,1) PRIMARY KEY,
+    CaseID INT NOT NULL, -- Target Case ID
+    DateSubmitted DATETIME NOT NULL DEFAULT GETDATE(),
+    DateReleased DATETIME NULL, -- Anchor point determining procedural scoring lockdown windows
+    
+    -- Category Scoring metrics wrapped with strict data layer boundary bounds
+    Cat1_Score DECIMAL(5,2) NULL CONSTRAINT CHK_Cat1 CHECK (Cat1_Score BETWEEN 0 AND 100),
+    Cat2_Score DECIMAL(5,2) NULL CONSTRAINT CHK_Cat2 CHECK (Cat2_Score BETWEEN 0 AND 100),
+    Cat3_Score DECIMAL(5,2) NULL CONSTRAINT CHK_Cat3 CHECK (Cat3_Score BETWEEN 0 AND 100),
+    
+    -- Math Compute Matrix
+    TotalScore AS (ISNULL(Cat1_Score, 0) + ISNULL(Cat2_Score, 0) + ISNULL(Cat3_Score, 0)) PERSISTED,
+    IsPass AS (CASE WHEN (ISNULL(Cat1_Score, 0) + ISNULL(Cat2_Score, 0) + ISNULL(Cat3_Score, 0)) >= 96.80 THEN 1 ELSE 0 END) PERSISTED,
+    
+    -- Double Jeopardy Logic Flags
+    IsDoubleJeopardyApplied BIT NOT NULL DEFAULT 0,
+    DoubleJeopardyApprovedByID INT NULL CONSTRAINT FK_AuditReviews_DJApproved REFERENCES Users(UserID),
+    
+    -- Metadata Flags Driving Automated Privacy Routing
+    ContainsFTI BIT NOT NULL DEFAULT 0,
+    ContainsPHI BIT NOT NULL DEFAULT 0,
+    ContainsMHI BIT NOT NULL DEFAULT 0,
+    Contains42CFR BIT NOT NULL DEFAULT 0,
+    ContainsPII BIT NOT NULL DEFAULT 0,
+    
+    ClassificationDate DATETIME NULL,
+    ClassifiedByID INT NULL CONSTRAINT FK_AuditReviews_ClassifiedBy REFERENCES Users(UserID),
+    ClassificationJustification NVARCHAR(500) NULL,
+    DataRetentionExpiry DATETIME NULL, -- Field evaluated dynamically via archiving engine
+    
+    FinalizedHash VARBINARY(32) NULL, -- Houses SHA-256 state tracking signature
+    IsPurged BIT NOT NULL DEFAULT 0
+);
+
+-- 2. Configuration Management Semantic Versioning Engine
+CREATE TABLE SchemaVersionLog (
+    VersionID INT IDENTITY(1,1) PRIMARY KEY,
+    SemanticVersion VARCHAR(20) NOT NULL, -- E.g., '3.0.0-UNIVERSAL'
+    ChangeTicketLinkage VARCHAR(50) NOT NULL, -- Enterprise Change Management ID
+    DeployScript NVARCHAR(MAX) NOT NULL,
+    RollbackScript NVARCHAR(MAX) NOT NULL,
+    ValidationQuery NVARCHAR(MAX) NOT NULL, -- Automated Verification Check
+    Environment VARCHAR(10) NOT NULL CONSTRAINT CHK_SchemaVersion_Env CHECK (Environment IN ('DEV','TEST','STAGING','PROD','DR')),
+    ExecutionDateTime DATETIME NOT NULL DEFAULT GETDATE(),
+    IsRolledBack BIT NOT NULL DEFAULT 0,
+    RollbackReason NVARCHAR(500) NULL
+);
+GO
+
+-- ================================================================================
+-- SECTION 4: TRIGGER LAYER FOR IMMUTABILITY & ENFORCEMENT
+-- ================================================================================
+
+-- Trigger: Blocks Delete operations on System Logs
+CREATE TRIGGER tr_PreventAuditTampering_SystemLog 
+ON SystemAuditLog
+INSTEAD OF DELETE
+AS
+BEGIN
+    RAISERROR('Enterprise Compliance Mandated Constraint: Physical erasure of active logs is completely blocked.', 16, 1);
+    ROLLBACK TRANSACTION;
+END;
+GO
+
+CREATE TRIGGER tr_PreventAuditTampering_FTILog 
+ON FTI_AccessLog
+INSTEAD OF DELETE
+AS
+BEGIN
+    RAISERROR('Security Protocol Violation: Sensitive access chains cannot be physically purged.', 16, 1);
+    ROLLBACK TRANSACTION;
+END;
+GO
+
+-- Trigger: Handles Automatic Scoring Lockdown and Generates Cryptographic Signatures
+CREATE TRIGGER tr_AuditReviews_ScoringControl
+ON AuditReviews
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- A: Intercept data mutation requests after evaluation release
+    IF EXISTS (
+        SELECT 1 
+        FROM inserted i
+        JOIN deleted d ON i.AuditReviewID = d.AuditReviewID
+        WHERE d.DateReleased IS NOT NULL 
+          AND (i.Cat1_Score <> d.Cat1_Score OR i.Cat2_Score <> d.Cat2_Score OR i.Cat3_Score <> d.Cat3_Score)
+    )
+    BEGIN
+        -- Cross-verify active context matching using session context
+        IF NOT EXISTS (
+            SELECT 1 
+            FROM BreakGlassLog b
+            WHERE b.UserID = (SELECT UserID FROM Users WHERE IdentityUserGUID = TRY_CAST(SESSION_CONTEXT(N'IDENTITY_USER_GUID') AS UNIQUEIDENTIFIER))
+              AND b.Approved = 1 
+              AND GETDATE() <= b.ReviewDeadline
+        )
+        BEGIN
+            RAISERROR('Quality Control Lockout: Scoring records are immutable post-release unless an authorized Break-Glass instance is initiated.', 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END;
+    END;
+
+    -- B: Automate Cryptographic Signature generation upon release
+    IF UPDATE(DateReleased) OR UPDATE(Cat1_Score) OR UPDATE(Cat2_Score) OR UPDATE(Cat3_Score) OR UPDATE(IsDoubleJeopardyApplied)
+    BEGIN
+        UPDATE ar
+        SET ar.FinalizedHash = HASHBYTES('SHA2_256', 
+            CONCAT(
+                CAST(i.CaseID AS VARCHAR(20)), '|',
+                CAST(ISNULL(i.Cat1_Score, 0) AS VARCHAR(20)), '|',
+                CAST(ISNULL(i.Cat2_Score, 0) AS VARCHAR(20)), '|',
+                CAST(ISNULL(i.Cat3_Score, 0) AS VARCHAR(20)), '|',
+                CAST(i.IsDoubleJeopardyApplied AS VARCHAR(1)), '|',
+                ISNULL(CONVERT(VARCHAR(30), i.DateReleased, 126), 'UNRELEASED')
+            )
+        )
+        FROM AuditReviews ar
+        JOIN inserted i ON ar.AuditReviewID = i.AuditReviewID
+        WHERE i.DateReleased IS NOT NULL;
+    END;
+END;
+GO
+
+-- ================================================================================
+-- SECTION 5: ENTERPRISE STORAGE INTERFACES & AUTOMATION
+-- ================================================================================
+
+-- Stored Procedure: Evaluates and handles chronological rebuttal windows
+CREATE PROCEDURE sp_SubmitRebuttal
+    @AuditReviewID INT,
+    @UserComment NVARCHAR(MAX)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @ReleaseDate DATETIME;
+    SELECT @ReleaseDate = DateReleased FROM AuditReviews WHERE AuditReviewID = @AuditReviewID;
+
+    -- Enforces strict dispute/rebuttal window
+    IF @ReleaseDate IS NULL OR GETDATE() > DATEADD(day, 5, @ReleaseDate)
+    BEGIN
+        DECLARE @Err NVARCHAR(400);
+        SET @Err = CONCAT('Business Rule Violation: The strict dispute/rebuttal window has expired. Release Date: ', 
+                          ISNULL(CONVERT(VARCHAR(30), @ReleaseDate, 120), 'Not Yet Released'));
+        RAISERROR(@Err, 16, 1);
+        RETURN;
+    END;
+
+    PRINT 'Rebuttal logged successfully within compliance rules.';
+END;
+GO
+
+-- Stored Procedure: Validates data state integrity against out-of-band manual overrides
+CREATE PROCEDURE sp_VerifyAuditIntegrity
+    @AuditReviewID INT,
+    @Outcome VARCHAR(20) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @StoredHash VARBINARY(32);
+    DECLARE @CalculatedHash VARBINARY(32);
+    DECLARE @ReleaseDate DATETIME;
+
+    SELECT 
+        @StoredHash = FinalizedHash,
+        @ReleaseDate = DateReleased,
+        @CalculatedHash = HASHBYTES('SHA2_256', 
+            CONCAT(
+                CAST(CaseID AS VARCHAR(20)), '|',
+                CAST(ISNULL(Cat1_Score, 0) AS VARCHAR(20)), '|',
+                CAST(ISNULL(Cat2_Score, 0) AS VARCHAR(20)), '|',
+                CAST(ISNULL(Cat3_Score, 0) AS VARCHAR(20)), '|',
+                CAST(IsDoubleJeopardyApplied AS VARCHAR(1)), '|',
+                ISNULL(CONVERT(VARCHAR(30), DateReleased, 126), 'UNRELEASED')
+            )
+        )
+    FROM AuditReviews 
+    WHERE AuditReviewID = @AuditReviewID;
+
+    IF @ReleaseDate IS NULL
+        SET @Outcome = 'UNRELEASED';
+    ELSE IF @StoredHash = @CalculatedHash
+        SET @Outcome = 'VALID';
+    ELSE
+        SET @Outcome = 'TAMPERED';
+END;
+GO
+
+-- Stored Procedure: Handles automated statutory retention purging
+CREATE PROCEDURE sp_PurgeExpiredData
+    @DryRun BIT = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    IF @DryRun = 1
+    BEGIN
+        SELECT 'PREVIEW RETENTION PURGE', AuditReviewID, CaseID, DataRetentionExpiry 
+        FROM AuditReviews 
+        WHERE DataRetentionExpiry <= GETDATE() AND IsPurged = 0;
+    END;
+    ELSE
+    BEGIN
+        BEGIN TRANSACTION;
+        
+        -- Performs compliance soft purge to preserve historical system audit trends
+        UPDATE AuditReviews
+        SET IsPurged = 1,
+            Cat1_Score = NULL,
+            Cat2_Score = NULL,
+            Cat3_Score = NULL
+        WHERE DataRetentionExpiry <= GETDATE() AND IsPurged = 0;
+        
+        COMMIT TRANSACTION;
+    END;
+END;
+GO
+
+-- ================================================================================
+-- SECTION 6: ROLE-BASED SEGREGATED ENTERPRISE INTERFACE VIEWS
+-- ================================================================================
+
+-- View: Restricted Caseworker Interface
+CREATE VIEW vw_AuditReviews_Caseworker AS
+SELECT AuditReviewID, CaseID, DateReleased, TotalScore, IsPass
+FROM AuditReviews
+WHERE DateReleased IS NOT NULL AND IsPurged = 0;
+GO
+
+-- View: Complete Processing Analysis View for QA Technical Analysts
+CREATE VIEW vw_AuditReviews_QATech AS
+SELECT AuditReviewID, CaseID, DateSubmitted, DateReleased, Cat1_Score, Cat2_Score, Cat3_Score, TotalScore, IsPass, IsDoubleJeopardyApplied
+FROM AuditReviews
+WHERE IsPurged = 0;
+GO
+
+-- View: Executive Management Monitoring Layer
+CREATE VIEW vw_AuditReviews_Supervisor AS
+SELECT AuditReviewID, CaseID, DateSubmitted, DateReleased, TotalScore, IsPass, ContainsFTI, ContainsPHI, ContainsMHI, Contains42CFR, ContainsPII, DataRetentionExpiry
+FROM AuditReviews
+WHERE IsPurged = 0;
+GO
+
+-- ================================================================================
+-- SECTION 7: DYNAMIC WEB APP & QUALITY AUDITING SCHEMA
+-- Schema Version: 3.0.0-UNIVERSAL | Classification: RESTRICTED
+-- Target: SQL Server 2022+ Dynamic Web Application Back-End
+-- Description: Supports Associate Audits, Rebuttal Workflow, Error Trend Heatmaps,
+--              Multi-Level Scorecards (Caseworker, Unit, Department), and
+--              Cross-Departmental Quality Interactions.
+-- ================================================================================
+
+-- --------------------------------------------------------------------------------
+-- 7.1 ORGANIZATIONAL STRUCTURE & MULTI-TIER HIERARCHY
+-- --------------------------------------------------------------------------------
+
+-- Departments Table
+CREATE TABLE Departments (
+    DeptID INT IDENTITY(1,1) PRIMARY KEY,
+    DeptCode NVARCHAR(20) NOT NULL UNIQUE,
+    DeptName NVARCHAR(100) NOT NULL,
+    DeptHeadUserID INT NULL,
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedAt DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- Units Table (Sub-division of Departments)
+CREATE TABLE Units (
+    UnitID INT IDENTITY(1,1) PRIMARY KEY,
+    DeptID INT NOT NULL CONSTRAINT FK_Units_Departments REFERENCES Departments(DeptID),
+    UnitCode NVARCHAR(20) NOT NULL UNIQUE,
+    UnitName NVARCHAR(100) NOT NULL,
+    SupervisorUserID INT NULL,
+    LeadWorkerUserID INT NULL,
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedAt DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- Extended User Hierarchy Mapping
+CREATE TABLE UserOrgAssignments (
+    AssignmentID INT IDENTITY(1,1) PRIMARY KEY,
+    UserID INT NOT NULL CONSTRAINT FK_UserOrg_Users REFERENCES Users(UserID),
+    UnitID INT NOT NULL CONSTRAINT FK_UserOrg_Units REFERENCES Units(UnitID),
+    DeptID INT NOT NULL CONSTRAINT FK_UserOrg_Departments REFERENCES Departments(DeptID),
+    AssignedRole NVARCHAR(50) NOT NULL CONSTRAINT CHK_UserOrg_Role CHECK (
+        AssignedRole IN ('ASSOCIATE', 'QA_ANALYST', 'QA_SUPERVISOR', 'DEV_SPECIALIST', 'UNIT_SUPERVISOR', 'LEAD_WORKER', 'DEPT_DIRECTOR')
+    ),
+    AssignedDate DATETIME NOT NULL DEFAULT GETDATE(),
+    IsPrimaryAssignment BIT NOT NULL DEFAULT 1
+);
+
+-- --------------------------------------------------------------------------------
+-- 7.2 ERROR TAXONOMY & HEATMAP METRICS ENGINE
+-- --------------------------------------------------------------------------------
+
+-- High-Level Error Categories
+CREATE TABLE ErrorCategories (
+    CategoryID INT IDENTITY(1,1) PRIMARY KEY,
+    CategoryCode NVARCHAR(20) NOT NULL UNIQUE,
+    CategoryName NVARCHAR(100) NOT NULL,
+    Description NVARCHAR(500) NULL,
+    WeightMultiplier DECIMAL(3,2) NOT NULL DEFAULT 1.00,
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- Granular Sub-Categories
+CREATE TABLE ErrorSubCategories (
+    SubCategoryID INT IDENTITY(1,1) PRIMARY KEY,
+    CategoryID INT NOT NULL CONSTRAINT FK_SubCat_Categories REFERENCES ErrorCategories(CategoryID),
+    SubCategoryCode NVARCHAR(20) NOT NULL UNIQUE,
+    SubCategoryName NVARCHAR(100) NOT NULL,
+    Description NVARCHAR(500) NULL,
+    SeverityLevel NVARCHAR(20) NOT NULL CONSTRAINT CHK_SubCat_Severity CHECK (SeverityLevel IN ('CRITICAL', 'MAJOR', 'MINOR', 'INFORMATIONAL')),
+    DeductionPoints DECIMAL(5,2) NOT NULL DEFAULT 0.00
+);
+
+-- Specific Auditable Elements / Checklist Rules
+CREATE TABLE ErrorElements (
+    ElementID INT IDENTITY(1,1) PRIMARY KEY,
+    SubCategoryID INT NOT NULL CONSTRAINT FK_Elements_SubCat REFERENCES ErrorSubCategories(SubCategoryID),
+    ElementCode NVARCHAR(30) NOT NULL UNIQUE,
+    ElementName NVARCHAR(200) NOT NULL,
+    PolicyReference NVARCHAR(250) NULL, -- Rule or Statutory citation
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- --------------------------------------------------------------------------------
+-- 7.3 AUDIT EXECUTION & DETAILED FINDINGS LOGGING
+-- --------------------------------------------------------------------------------
+
+-- Audit Review Header Extension
+CREATE TABLE AuditReviewHeader (
+    AuditHeaderID INT IDENTITY(1,1) PRIMARY KEY,
+    AuditReviewID INT NOT NULL UNIQUE CONSTRAINT FK_AuditHeader_AuditReviews REFERENCES AuditReviews(AuditReviewID),
+    CaseworkerUserID INT NOT NULL CONSTRAINT FK_AuditHeader_Caseworker REFERENCES Users(UserID),
+    QAAnalystUserID INT NOT NULL CONSTRAINT FK_AuditHeader_QA REFERENCES Users(UserID),
+    LeadWorkerUserID INT NULL CONSTRAINT FK_AuditHeader_Lead REFERENCES Users(UserID),
+    UnitID INT NOT NULL CONSTRAINT FK_AuditHeader_Units REFERENCES Units(UnitID),
+    DeptID INT NOT NULL CONSTRAINT FK_AuditHeader_Depts REFERENCES Departments(DeptID),
+    AuditMonth INT NOT NULL CONSTRAINT CHK_AuditMonth CHECK (AuditMonth BETWEEN 1 AND 12),
+    AuditYear INT NOT NULL CONSTRAINT CHK_AuditYear CHECK (AuditYear BETWEEN 2020 AND 2099),
+    ReviewStage NVARCHAR(30) NOT NULL DEFAULT 'DRAFT' CONSTRAINT CHK_ReviewStage CHECK (
+        ReviewStage IN ('DRAFT', 'SUBMITTED_TO_ASSOCIATE', 'REBUTTAL_PENDING', 'UNDER_QA_REVIEW', 'ESCALATED_TO_SUPERVISOR', 'FINALIZED', 'RELEASED')
+    ),
+    AssociateAcknowledgedAt DATETIME NULL,
+    FinalScore DECIMAL(5,2) NULL,
+    CreatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+    UpdatedAt DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- Individual Line-Item Findings per Audit
+CREATE TABLE AuditErrorDetails (
+    AuditErrorID INT IDENTITY(1,1) PRIMARY KEY,
+    AuditReviewID INT NOT NULL CONSTRAINT FK_ErrorDetails_AuditReviews REFERENCES AuditReviews(AuditReviewID),
+    ElementID INT NOT NULL CONSTRAINT FK_ErrorDetails_Elements REFERENCES ErrorElements(ElementID),
+    ErrorSeverity NVARCHAR(20) NOT NULL,
+    PointsDeducted DECIMAL(5,2) NOT NULL DEFAULT 0.00,
+    AuditorNotes NVARCHAR(MAX) NOT NULL,
+    IsRebutted BIT NOT NULL DEFAULT 0,
+    RebuttalStatus NVARCHAR(20) NOT NULL DEFAULT 'NONE' CONSTRAINT CHK_ErrorRebuttalStatus CHECK (
+        RebuttalStatus IN ('NONE', 'PENDING', 'UPHELD', 'OVERTURNED', 'WITHDRAWN')
+    )
+);
+
+-- --------------------------------------------------------------------------------
+-- 7.4 REBUTTAL WORKFLOW & CROSS-DEPARTMENTAL INTERACTION
+-- --------------------------------------------------------------------------------
+
+-- Rebuttal Submissions Header
+CREATE TABLE Rebuttals (
+    RebuttalID INT IDENTITY(1,1) PRIMARY KEY,
+    AuditReviewID INT NOT NULL CONSTRAINT FK_Rebuttals_AuditReviews REFERENCES AuditReviews(AuditReviewID),
+    AuditErrorID INT NULL CONSTRAINT FK_Rebuttals_AuditError REFERENCES AuditErrorDetails(AuditErrorID),
+    SubmittedByUserID INT NOT NULL CONSTRAINT FK_Rebuttals_SubmittedBy REFERENCES Users(UserID),
+    RebuttalReason NVARCHAR(MAX) NOT NULL,
+    PolicyJustification NVARCHAR(MAX) NULL,
+    Status NVARCHAR(30) NOT NULL DEFAULT 'SUBMITTED' CONSTRAINT CHK_RebuttalStatus CHECK (
+        Status IN ('SUBMITTED', 'IN_QA_REVIEW', 'ACCEPTED_BY_QA', 'REJECTED_BY_QA', 'ESCALATED_TO_SUPERVISOR', 'FINAL_RESOLUTION')
+    ),
+    AssignedQAUserID INT NULL CONSTRAINT FK_Rebuttals_AssignedQA REFERENCES Users(UserID),
+    SupervisorUserID INT NULL CONSTRAINT FK_Rebuttals_Supervisor REFERENCES Users(UserID),
+    ResolutionSummary NVARCHAR(MAX) NULL,
+    ScoreAdjusted BIT NOT NULL DEFAULT 0,
+    OriginalScore DECIMAL(5,2) NULL,
+    AdjustedScore DECIMAL(5,2) NULL,
+    SubmittedAt DATETIME NOT NULL DEFAULT GETDATE(),
+    ResolvedAt DATETIME NULL
+);
+
+-- Rebuttal Discussion Thread (Enables Agency & Quality Dept Dialogue)
+CREATE TABLE RebuttalThread (
+    ThreadID BIGINT IDENTITY(1,1) PRIMARY KEY,
+    RebuttalID INT NOT NULL CONSTRAINT FK_Thread_Rebuttals REFERENCES Rebuttals(RebuttalID),
+    SenderUserID INT NOT NULL CONSTRAINT FK_Thread_Sender REFERENCES Users(UserID),
+    SenderRole NVARCHAR(50) NOT NULL,
+    MessageText NVARCHAR(MAX) NOT NULL,
+    AttachmentURL NVARCHAR(500) NULL,
+    SentAt DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- --------------------------------------------------------------------------------
+-- 7.5 ASSOCIATE DEVELOPMENT & COACHING TRACKING
+-- --------------------------------------------------------------------------------
+
+-- Coaching & Action Plan Engine
+CREATE TABLE AssociateDevelopmentPlans (
+    PlanID INT IDENTITY(1,1) PRIMARY KEY,
+    CaseworkerUserID INT NOT NULL CONSTRAINT FK_DevPlan_Caseworker REFERENCES Users(UserID),
+    DevSpecialistUserID INT NOT NULL CONSTRAINT FK_DevPlan_DevSpec REFERENCES Users(UserID),
+    UnitID INT NOT NULL CONSTRAINT FK_DevPlan_Unit REFERENCES Units(UnitID),
+    TargetCategoryID INT NULL CONSTRAINT FK_DevPlan_Category REFERENCES ErrorCategories(CategoryID),
+    TriggerAuditID INT NULL CONSTRAINT FK_DevPlan_Audit REFERENCES AuditReviews(AuditReviewID),
+    PlanTitle NVARCHAR(150) NOT NULL,
+    ActionItems NVARCHAR(MAX) NOT NULL,
+    Status NVARCHAR(20) NOT NULL DEFAULT 'ACTIVE' CONSTRAINT CHK_DevPlanStatus CHECK (
+        Status IN ('ACTIVE', 'UNDER_REVIEW', 'COMPLETED', 'EXTENDED', 'CANCELLED')
+    ),
+    StartDate DATE NOT NULL,
+    TargetCompletionDate DATE NOT NULL,
+    ActualCompletionDate DATE NULL
+);
+
+-- --------------------------------------------------------------------------------
+-- 7.6 REPORTING VIEWS: SCORECARDS & HEATMAP TREND ANALYSIS
+-- --------------------------------------------------------------------------------
+
+-- View 1: Caseworker Individual Monthly Scorecard
+GO
+CREATE VIEW vw_Caseworker_MonthlyScorecard AS
+SELECT 
+    h.CaseworkerUserID,
+    u.Username AS CaseworkerName,
+    h.UnitID,
+    un.UnitName,
+    h.DeptID,
+    d.DeptName,
+    h.AuditYear,
+    h.AuditMonth,
+    COUNT(h.AuditReviewID) AS TotalAudits,
+    AVG(h.FinalScore) AS AverageScore,
+    SUM(CASE WHEN ar.IsPass = 1 THEN 1 ELSE 0 END) AS TotalPassed,
+    SUM(CASE WHEN ar.IsPass = 0 THEN 1 ELSE 0 END) AS TotalFailed,
+    CAST(ROUND((SUM(CASE WHEN ar.IsPass = 1 THEN 1.0 ELSE 0.0 END) / COUNT(h.AuditReviewID)) * 100, 2) AS DECIMAL(5,2)) AS PassRatePercentage
+FROM AuditReviewHeader h
+JOIN Users u ON h.CaseworkerUserID = u.UserID
+JOIN Units un ON h.UnitID = un.UnitID
+JOIN Departments d ON h.DeptID = d.DeptID
+JOIN AuditReviews ar ON h.AuditReviewID = ar.AuditReviewID
+WHERE h.ReviewStage IN ('FINALIZED', 'RELEASED')
+GROUP BY h.CaseworkerUserID, u.Username, h.UnitID, un.UnitName, h.DeptID, d.DeptName, h.AuditYear, h.AuditMonth;
+GO
+
+-- View 2: Unit-Level Monthly Scorecard
+CREATE VIEW vw_Unit_MonthlyScorecard AS
+SELECT 
+    h.UnitID,
+    un.UnitName,
+    h.DeptID,
+    d.DeptName,
+    h.AuditYear,
+    h.AuditMonth,
+    COUNT(DISTINCT h.CaseworkerUserID) AS ActiveCaseworkersAudited,
+    COUNT(h.AuditReviewID) AS TotalUnitAudits,
+    AVG(h.FinalScore) AS UnitAverageScore,
+    CAST(ROUND((SUM(CASE WHEN ar.IsPass = 1 THEN 1.0 ELSE 0.0 END) / COUNT(h.AuditReviewID)) * 100, 2) AS DECIMAL(5,2)) AS UnitPassRate
+FROM AuditReviewHeader h
+JOIN Units un ON h.UnitID = un.UnitID
+JOIN Departments d ON h.DeptID = d.DeptID
+JOIN AuditReviews ar ON h.AuditReviewID = ar.AuditReviewID
+WHERE h.ReviewStage IN ('FINALIZED', 'RELEASED')
+GROUP BY h.UnitID, un.UnitName, h.DeptID, d.DeptName, h.AuditYear, h.AuditMonth;
+GO
+
+-- View 3: Department-Level Monthly Scorecard
+CREATE VIEW vw_Department_MonthlyScorecard AS
+SELECT 
+    h.DeptID,
+    d.DeptName,
+    h.AuditYear,
+    h.AuditMonth,
+    COUNT(DISTINCT h.UnitID) AS UnitsAudited,
+    COUNT(DISTINCT h.CaseworkerUserID) AS CaseworkersAudited,
+    COUNT(h.AuditReviewID) AS TotalDeptAudits,
+    AVG(h.FinalScore) AS DeptAverageScore,
+    CAST(ROUND((SUM(CASE WHEN ar.IsPass = 1 THEN 1.0 ELSE 0.0 END) / COUNT(h.AuditReviewID)) * 100, 2) AS DECIMAL(5,2)) AS DeptPassRate
+FROM AuditReviewHeader h
+JOIN Departments d ON h.DeptID = d.DeptID
+JOIN AuditReviews ar ON h.AuditReviewID = ar.AuditReviewID
+WHERE h.ReviewStage IN ('FINALIZED', 'RELEASED')
+GROUP BY h.DeptID, d.DeptName, h.AuditYear, h.AuditMonth;
+GO
+
+-- View 4: Error Trend Heatmap Dataset
+CREATE VIEW vw_ErrorTrends_HeatmapData AS
+SELECT 
+    h.DeptID,
+    d.DeptName,
+    h.UnitID,
+    un.UnitName,
+    h.CaseworkerUserID,
+    u.Username AS CaseworkerName,
+    h.AuditYear,
+    h.AuditMonth,
+    ec.CategoryID,
+    ec.CategoryName,
+    esc.SubCategoryID,
+    esc.SubCategoryName,
+    ee.ElementID,
+    ee.ElementName,
+    COUNT(ed.AuditErrorID) AS ErrorOccurrenceCount,
+    SUM(ed.PointsDeducted) AS TotalPointsDeducted
+FROM AuditErrorDetails ed
+JOIN AuditReviewHeader h ON ed.AuditReviewID = h.AuditReviewID
+JOIN ErrorElements ee ON ed.ElementID = ee.ElementID
+JOIN ErrorSubCategories esc ON ee.SubCategoryID = esc.SubCategoryID
+JOIN ErrorCategories ec ON esc.CategoryID = ec.CategoryID
+JOIN Departments d ON h.DeptID = d.DeptID
+JOIN Units un ON h.UnitID = un.UnitID
+JOIN Users u ON h.CaseworkerUserID = u.UserID
+WHERE h.ReviewStage IN ('FINALIZED', 'RELEASED')
+GROUP BY h.DeptID, d.DeptName, h.UnitID, un.UnitName, h.CaseworkerUserID, u.Username, h.AuditYear, h.AuditMonth, ec.CategoryID, ec.CategoryName, esc.SubCategoryID, esc.SubCategoryName, ee.ElementID, ee.ElementName;
+GO
+
+-- --------------------------------------------------------------------------------
+-- 7.7 STORED PROCEDURES FOR WEB APP DYNAMIC DATA FETCHING
+-- --------------------------------------------------------------------------------
+
+-- Procedure 1: Fetch Heatmap Data for Dynamic Web Dashboard
+CREATE PROCEDURE sp_GetErrorHeatmap
+    @DeptID INT = NULL,
+    @UnitID INT = NULL,
+    @AuditYear INT = NULL,
+    @AuditMonth INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        DeptID, DeptName, UnitID, UnitName,
+        AuditYear, AuditMonth, CategoryName, SubCategoryName, ElementName,
+        SUM(ErrorOccurrenceCount) AS HeatmapValue,
+        SUM(TotalPointsDeducted) AS SeverityImpact
+    FROM vw_ErrorTrends_HeatmapData
+    WHERE (@DeptID IS NULL OR DeptID = @DeptID)
+      AND (@UnitID IS NULL OR UnitID = @UnitID)
+      AND (@AuditYear IS NULL OR AuditYear = @AuditYear)
+      AND (@AuditMonth IS NULL OR AuditMonth = @AuditMonth)
+    GROUP BY DeptID, DeptName, UnitID, UnitName, AuditYear, AuditMonth, CategoryName, SubCategoryName, ElementName
+    ORDER BY HeatmapValue DESC;
+END;
+GO
+
+-- Procedure 2: Submit Rebuttal and Trigger Workflow Update
+CREATE PROCEDURE sp_SubmitAssociateRebuttal
+    @AuditReviewID INT,
+    @AuditErrorID INT = NULL,
+    @SubmittedByUserID INT,
+    @RebuttalReason NVARCHAR(MAX),
+    @PolicyJustification NVARCHAR(MAX) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRANSACTION;
+
+    TRY
+        -- 1. Insert Rebuttal Record
+        INSERT INTO Rebuttals (AuditReviewID, AuditErrorID, SubmittedByUserID, RebuttalReason, PolicyJustification, Status)
+        VALUES (@AuditReviewID, @AuditErrorID, @SubmittedByUserID, @RebuttalReason, @PolicyJustification, 'SUBMITTED');
+
+        -- 2. Update Header Review Stage
+        UPDATE AuditReviewHeader
+        SET ReviewStage = 'REBUTTAL_PENDING',
+            UpdatedAt = GETDATE()
+        WHERE AuditReviewID = @AuditReviewID;
+
+        -- 3. Flag Line Item if applicable
+        IF @AuditErrorID IS NOT NULL
+        BEGIN
+            UPDATE AuditErrorDetails
+            SET IsRebutted = 1, RebuttalStatus = 'PENDING'
+            WHERE AuditErrorID = @AuditErrorID;
+        END;
+
+        COMMIT TRANSACTION;
+        PRINT 'Rebuttal submitted successfully and stage updated to REBUTTAL_PENDING.';
+    CATCH
+        ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH;
+END;
+GO
+Context Initialization Command for Web Middleware:
+EXEC sp_set_session_context @key = N'IDENTITY_USER_GUID', @value = @InboundUserGUIDClaim;
+
